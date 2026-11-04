@@ -1,0 +1,438 @@
+<?php
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
+
+require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/lib/fpdf/fpdf.php';
+
+requireLogin();
+
+$id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+$currentUserId = $_SESSION['user_id'];
+
+// Ambil Data Surat Tugas & Penandatangan/Pembuat
+$stmt = $pdo->prepare("
+    SELECT st.*, 
+           u_sign.name AS sign_name, u_sign.position AS sign_pos, u_sign.division AS sign_div, u_sign.department AS sign_dept, u_sign.signature AS sign_sig,
+           u_buat.name AS creator_name
+    FROM surat_tugas st
+    LEFT JOIN users u_sign ON st.ditandatangani_oleh = u_sign.id
+    LEFT JOIN users u_buat ON st.created_by = u_buat.id
+    WHERE st.id = ?
+");
+$stmt->execute([$id]);
+$surat = $stmt->fetch();
+
+if (!$surat) {
+    exit('Surat tugas tidak ditemukan.');
+}
+
+// Otorisasi Akses: Pembuat, Penandatangan, Terdaftar di Assigned, atau Admin
+$stmtCheckAssign = $pdo->prepare("SELECT COUNT(*) FROM surat_tugas_assigned WHERE surat_tugas_id = ? AND user_id = ?");
+$stmtCheckAssign->execute([$id, $currentUserId]);
+$isAssigned = $stmtCheckAssign->fetchColumn() > 0;
+$isCreator = ($surat['created_by'] == $currentUserId);
+$isSigner = ($surat['ditandatangani_oleh'] == $currentUserId);
+$isAdmin = (($_SESSION['role'] ?? '') === 'admin');
+
+if (!$isCreator && !$isSigner && !$isAssigned && !$isAdmin) {
+    exit('Anda tidak memiliki akses ke surat tugas ini.');
+}
+
+// Ambil daftar personel yang ditugaskan
+$stmtAssignedUsers = $pdo->prepare("
+    SELECT u.name, u.position, u.division, u.department 
+    FROM surat_tugas_assigned sta
+    JOIN users u ON sta.user_id = u.id
+    WHERE sta.surat_tugas_id = ?
+    ORDER BY u.name ASC
+");
+$stmtAssignedUsers->execute([$id]);
+$assignedList = $stmtAssignedUsers->fetchAll();
+
+function tgl_indo_pdf($tanggal) {
+    if (empty($tanggal)) return '-';
+    $bulan = [
+        1 => 'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+        'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'
+    ];
+    $pecahkan = explode('-', date('Y-m-d', strtotime($tanggal)));
+    return $pecahkan[2] . ' ' . $bulan[(int)$pecahkan[1]] . ' ' . $pecahkan[0];
+}
+
+$statusSurat = trim(strtolower($surat['status'] ?? $surat['status_surat'] ?? 'draft'));
+$isCompleted = ($statusSurat === 'complete' || $statusSurat === 'published');
+
+/* GENERATE QR CODE */
+$qrDir = APP_PATH . '/uploads/qrcodes';
+if (!is_dir($qrDir)) {
+    mkdir($qrDir, 0755, true);
+}
+$qrPath = $qrDir . '/qr_st_' . $surat['id'] . '.png';
+$scanUrl = APP_URL . '/surattugas_scan.php?id=' . urlencode($surat['id']);
+
+if ($isCompleted) {
+    $apiUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' . urlencode($scanUrl);
+    $qrImageData = @file_get_contents($apiUrl);
+
+    if ($qrImageData !== false && strlen($qrImageData) > 0) {
+        file_put_contents($qrPath, $qrImageData);
+    }
+}
+
+/* ================================================================
+ * PDF CLASS
+ * Layout dibuat mengikuti surattugas_view.php:
+ * - A4, margin kiri/kanan 20 mm, atas 10 mm
+ * - Times New Roman 12 pt sebagai font dokumen
+ * - HTML dari database diproses secara semantik (p, ol, ul, li)
+ * - Nested list a., b. dan 1., 2., 3. dipertahankan
+ * ================================================================ */
+class SuratTugasPDF extends FPDF
+{
+    public $status;
+    public $watermarkLogo;
+
+    function Header()
+    {
+        $statusLower = trim(strtolower($this->status));
+        if (($statusLower === 'complete' || $statusLower === 'published') && file_exists($this->watermarkLogo)) {
+            $this->SetAlpha(0.07);
+            $this->Image($this->watermarkLogo, 45, 80, 120);
+            $this->SetAlpha(1);
+        }
+    }
+
+    function SetAlpha($alpha, $bm='Normal')
+    {
+        // FPDF standar tidak selalu memiliki alpha transparency.
+        // Method ini sengaja no-op agar kompatibel dengan instalasi FPDF saat ini.
+    }
+
+    function Footer()
+    {
+        $this->SetY(-25);
+        $this->SetDrawColor(0, 0, 0);
+        $this->SetLineWidth(0.4);
+        $this->Line(20, $this->GetY(), 190, $this->GetY());
+        $this->Ln(2);
+
+        $this->SetTextColor(50, 50, 50);
+        $this->SetFont('Times', '', 8);
+        $this->Cell(0, 3.5, 'Email : lampungjasautama@gmail.com    Phone : +62 812 9292 3311', 0, 1, 'C');
+        $this->Cell(0, 3.5, 'Alamat : Jl.Jend. Sudirman No.81, Tj.Raya, Kec. Kedamaian, Kota Bandar Lampung, Lampung 35128.', 0, 0, 'C');
+        $this->SetTextColor(0, 0, 0);
+    }
+
+    function DocumentFont($style='')
+    {
+        // 12pt di view setara dengan sekitar 4.23 mm pada FPDF.
+        $this->SetFont('Times', $style, 12);
+    }
+
+    function TextLine($text, $indent=0, $height=6.8, $align='J')
+    {
+        $text = trim(preg_replace('/\s+/u', ' ', html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8')));
+        if ($text === '') return;
+        $this->SetX(20 + $indent);
+        $this->MultiCell(170 - $indent, $height, $text, 0, $align);
+    }
+
+    /**
+     * Render HTML yang disimpan di database agar struktur visualnya mendekati
+     * .standard-doc-text pada surattugas_view.php.
+     */
+    function WriteHTML($html)
+    {
+        if (trim((string)$html) === '') return;
+
+        $html = str_replace(["\r\n", "\r"], "\n", $html);
+        $html = preg_replace('/<o:p>.*?<\/o:p>/is', '', $html);
+        $html = preg_replace('/<span[^>]*>\s*<\/span>/is', '', $html);
+
+        // DOMDocument memerlukan wrapper UTF-8 agar karakter database terbaca benar.
+        if (!class_exists('DOMDocument')) {
+            $plain = trim(strip_tags(html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8')));
+            if ($plain !== '') $this->TextLine($plain);
+            return;
+        }
+
+        $dom = new DOMDocument('1.0', 'UTF-8');
+        libxml_use_internal_errors(true);
+        $ok = $dom->loadHTML('<?xml encoding="UTF-8"><div id="pdf-root">' . $html . '</div>', LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        libxml_clear_errors();
+
+        if (!$ok) {
+            $plain = trim(strip_tags(html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8')));
+            $this->TextLine($plain);
+            return;
+        }
+
+        $root = $dom->getElementById('pdf-root');
+        if (!$root) $root = $dom->documentElement;
+        $this->renderNodes($root->childNodes, 0, null);
+    }
+
+    function renderNodes($nodes, $listDepth=0, $listType=null)
+    {
+        foreach ($nodes as $node) {
+            if ($node->nodeType === XML_TEXT_NODE) {
+                $text = trim(preg_replace('/\s+/u', ' ', $node->nodeValue));
+                if ($text !== '') $this->TextLine($text, $listDepth * 7, 6.8, 'J');
+                continue;
+            }
+            if ($node->nodeType !== XML_ELEMENT_NODE) continue;
+
+            $tag = strtolower($node->nodeName);
+
+            if ($tag === 'p') {
+                $text = $this->nodeText($node);
+                if ($text !== '') {
+                    $this->TextLine($text, $listDepth * 7, 6.8, 'J');
+                    $this->Ln(3.0);
+                }
+                continue;
+            }
+
+            if ($tag === 'ol' || $tag === 'ul') {
+                $type = strtolower($node->getAttribute('type'));
+                if ($tag === 'ul') $type = 'bullet';
+                if ($type === '') $type = '1';
+                $this->renderList($node, $listDepth, $type);
+                continue;
+            }
+
+            if ($tag === 'br') {
+                $this->Ln(6.8);
+                continue;
+            }
+
+            if ($tag === 'div') {
+                $this->renderNodes($node->childNodes, $listDepth, $listType);
+                continue;
+            }
+
+            // Span/strong/em dan tag inline lain: ambil teksnya tanpa membawa
+            // style Word (Arial/Verdana) karena view memang memaksa Times 12pt.
+            $text = $this->nodeText($node);
+            if ($text !== '') $this->TextLine($text, $listDepth * 7, 6.8, 'J');
+        }
+    }
+
+    function renderList($listNode, $depth, $type)
+    {
+        $index = 0;
+        foreach ($listNode->childNodes as $li) {
+            if ($li->nodeType !== XML_ELEMENT_NODE || strtolower($li->nodeName) !== 'li') continue;
+            $index++;
+
+            $marker = $this->listMarker($index, $type);
+            $children = [];
+            $nested = [];
+            foreach ($li->childNodes as $child) {
+                if ($child->nodeType === XML_ELEMENT_NODE && in_array(strtolower($child->nodeName), ['ol','ul'], true)) {
+                    $nested[] = $child;
+                } else {
+                    $children[] = $child;
+                }
+            }
+
+            $text = '';
+            foreach ($children as $child) {
+                $text .= $child->textContent . ' ';
+            }
+            $text = trim(preg_replace('/\s+/u', ' ', $text));
+
+            $left = 20 + ($depth * 7);
+            $this->SetX($left);
+            $this->SetFont('Times', '', 12);
+            if ($text !== '') {
+                $this->Cell(8, 6.8, $marker, 0, 0, 'L');
+                $this->MultiCell(170 - ($depth * 7) - 8, 6.8, html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8'), 0, 'J');
+            }
+
+            foreach ($nested as $nestedList) {
+                $nestedType = strtolower($nestedList->getAttribute('type'));
+                if (strtolower($nestedList->nodeName) === 'ul') $nestedType = 'bullet';
+                if ($nestedType === '') $nestedType = '1';
+                $this->renderList($nestedList, $depth + 1, $nestedType);
+            }
+        }
+        $this->Ln(1.5);
+    }
+
+    function listMarker($index, $type)
+    {
+        if ($type === 'a') {
+            $n = $index;
+            $out = '';
+            while ($n > 0) {
+                $n--;
+                $out = chr(97 + ($n % 26)) . $out;
+                $n = intdiv($n, 26);
+            }
+            return $out . '.';
+        }
+        if ($type === 'A') {
+            return strtoupper($this->listMarker($index, 'a'));
+        }
+        if ($type === 'i') {
+            $map = [1=>'i',2=>'ii',3=>'iii',4=>'iv',5=>'v',6=>'vi',7=>'vii',8=>'viii',9=>'ix',10=>'x'];
+            return ($map[$index] ?? (string)$index) . '.';
+        }
+        if ($type === 'I') return strtoupper($this->listMarker($index, 'i'));
+        if ($type === 'bullet') return '•';
+        return $index . '.';
+    }
+
+    function nodeText($node)
+    {
+        $text = $node->textContent ?? '';
+        return trim(preg_replace('/\s+/u', ' ', html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8')));
+    }
+}
+
+// Inisialisasi PDF sesuai area dokumen pada surattugas_view.php.
+$pdf = new SuratTugasPDF('P', 'mm', 'A4');
+$pdf->status = $statusSurat;
+$pdf->watermarkLogo = __DIR__ . '/assets/img/watermarklogo.png';
+$pdf->SetMargins(20, 10, 20);
+$pdf->SetAutoPageBreak(true, 28);
+$pdf->AddPage();
+
+// 1. KOP SURAT
+$logoKop = __DIR__ . '/assets/img/lju_logo.png';
+if (file_exists($logoKop)) {
+    $pdf->Image($logoKop, 20, 10, 55);
+    $pdf->SetY(30);
+} else {
+    $pdf->SetY(20);
+}
+
+$pdf->SetDrawColor(0, 0, 0);
+$pdf->SetLineWidth(0.6);
+$pdf->Line(20, $pdf->GetY(), 190, $pdf->GetY());
+$pdf->SetLineWidth(0.2);
+$pdf->Ln(6);
+
+// 2. JUDUL DOKUMEN — sama dengan view: 14pt untuk judul, 12pt untuk nomor.
+$pdf->SetFont('Times', 'B', 14);
+$pdf->Cell(170, 7, 'SURAT TUGAS', 0, 1, 'C');
+$pdf->SetFont('Times', '', 12);
+$pdf->Cell(170, 6.8, 'Nomor : ' . $surat['nomor_surat'], 0, 1, 'C');
+$pdf->Ln(3);
+
+// 3. TEKS PEMBUKA
+$pdf->DocumentFont();
+$pdf->WriteHTML($surat['teks_pembuka']);
+$pdf->Ln(2);
+
+// 4. PEMBERI TUGAS & DAFTAR PERSONEL — mengikuti struktur view.
+$pdf->DocumentFont();
+$pdf->Cell(170, 6.8, 'Dengan ini memberikan tugas kepada:', 0, 1, 'L');
+$pdf->Ln(1);
+
+foreach ($assignedList as $person) {
+    $posLower = strtolower(trim($person['position'] ?? ''));
+    $displayLabel = $person['position'] ?? '-';
+    if ($posLower === 'staff') {
+        $displayLabel = 'Staff ' . ($person['division'] ?? '-');
+    } elseif ($posLower === 'kepala bidang') {
+        $displayLabel = 'Kepala Bidang ' . ($person['division'] ?? '-');
+    } elseif ($posLower === 'kepala divisi') {
+        $displayLabel = 'Kepala Divisi ' . ($person['department'] ?? '-');
+    }
+
+    $x = 27;
+    static $personNo = 1;
+    $pdf->SetX(20);
+    $pdf->SetFont('Times', '', 12);
+    $pdf->Cell(7, 6.8, $personNo . '.', 0, 0, 'L');
+    $pdf->SetX($x);
+    $pdf->SetFont('Times', '', 12);
+    $pdf->Cell(20, 6.8, 'Nama', 0, 0, 'L');
+    $pdf->Cell(4, 6.8, ':', 0, 0, 'C');
+    $pdf->SetFont('Times', 'B', 12);
+    $pdf->MultiCell(146, 6.8, $person['name'], 0, 'L');
+
+    $pdf->SetX($x);
+    $pdf->SetFont('Times', '', 12);
+    $pdf->Cell(20, 6.8, 'Jabatan', 0, 0, 'L');
+    $pdf->Cell(4, 6.8, ':', 0, 0, 'C');
+    $pdf->MultiCell(146, 6.8, $displayLabel, 0, 'L');
+    $pdf->Ln(1);
+    $personNo++;
+}
+
+// 5. BERITA PENUGASAN
+$pdf->SetFont('Times', '', 12);
+$pdf->WriteHTML($surat['berita_penugasan']);
+$pdf->Ln(1);
+
+// 6. PARAGRAF PENUTUP
+$pdf->WriteHTML('<p>Surat tugas ini berlaku pada tanggal ditetapkan dan dinyatakan berakhir sampai adanya perubahan, penyelesaian tugas, dan/atau pencabutan.</p>');
+$pdf->Ln(0);
+$pdf->WriteHTML('<p>Demikian surat tugas ini dibuat untuk dapat dipergunakan sebagaimana mestinya dengan penuh tanggung jawab.</p>');
+$pdf->Ln(4);
+
+// 7. TANDA TANGAN & QR CODE — mengikuti susunan kiri/kanan pada view.
+if ($pdf->GetY() > 205) {
+    $pdf->AddPage();
+}
+
+$ySign = $pdf->GetY();
+
+// Kiri: QR Code
+if ($isCompleted && file_exists($qrPath)) {
+    $pdf->Image($qrPath, 20, $ySign, 24, 24);
+    $pdf->SetXY(20, $ySign + 26);
+    $pdf->SetFont('Times', '', 8);
+    $pdf->MultiCell(75, 3.5, '[Dokumen ini ditandatangani secara digital]', 0, 'L');
+} else {
+    $pdf->SetXY(20, $ySign);
+    $pdf->SetFont('Times', 'I', 8);
+    $pdf->SetTextColor(120, 120, 120);
+    $pdf->Cell(75, 24, '[ QR Code ]', 1, 1, 'C');
+    $pdf->SetTextColor(0, 0, 0);
+    $pdf->SetXY(20, $ySign + 26);
+    $pdf->SetFont('Times', '', 8);
+    $pdf->MultiCell(75, 3.5, '[Dokumen ini ditandatangani secara digital]', 0, 'L');
+}
+
+// Kanan: Dikeluarkan di / Tanggal / Penandatangan
+$pdf->SetXY(110, $ySign);
+$pdf->SetFont('Times', '', 12);
+$pdf->Cell(36, 6.8, 'Dikeluarkan di', 0, 0, 'L');
+$pdf->Cell(4, 6.8, ':', 0, 0, 'C');
+$pdf->Cell(40, 6.8, 'Bandar Lampung', 0, 1, 'L');
+
+$pdf->SetX(110);
+$pdf->Cell(36, 6.8, 'Tanggal', 0, 0, 'L');
+$pdf->Cell(4, 6.8, ':', 0, 0, 'C');
+$pdf->Cell(50, 6.8, tgl_indo_pdf($surat['tanggal_surat']), 0, 1, 'L');
+
+$pdf->Ln(2);
+$pdf->SetX(110);
+$pdf->SetFont('Times', 'B', 12);
+$posText = trim(($surat['sign_pos'] ?? 'Pejabat Penandatangan') . ' ' . ($surat['sign_div'] ?? ''));
+$pdf->Cell(80, 6.8, $posText, 0, 1, 'C');
+
+$sigFile = SIGNATURE_PATH . '/' . basename($surat['sign_sig'] ?? '');
+if ($isCompleted && !empty($surat['sign_sig']) && file_exists($sigFile)) {
+    $pdf->Image($sigFile, 135, $pdf->GetY() + 2, 30, 15);
+    $pdf->Ln(18);
+} else {
+    $pdf->SetX(110);
+    $pdf->SetFont('Times', 'I', 9);
+    $pdf->SetTextColor(120, 120, 120);
+    $pdf->Cell(80, 15, '[ Menunggu Tanda Tangan ]', 0, 1, 'C');
+    $pdf->SetTextColor(0, 0, 0);
+}
+
+$pdf->SetX(110);
+$pdf->SetFont('Times', 'BU', 12);
+$pdf->Cell(80, 6.8, strtoupper($surat['sign_name'] ?? ''), 0, 1, 'C');
+
+// Output PDF
+$pdf->Output('I', 'Surat_Tugas_' . $surat['id'] . '.pdf');
